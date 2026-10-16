@@ -189,14 +189,21 @@ def inspect_command(store: Path = typer.Option(...), episode: str = typer.Option
 
 def get_replay_environment_config(source_config: dict, episode: str, overrides: dict | None = None) -> dict:
     config = copy.deepcopy(source_config["environment"])
-    config["environment_class"] = source_config["environment_type"]
+    config["environment_class"] = source_config.get("environment_type")
     if overrides is not None:
         overrides = copy.deepcopy(overrides.get("environment", overrides))
-        if "environment_class" in overrides and get_environment_class(
-            overrides["environment_class"]
-        ) is not get_environment_class(config["environment_class"]):
+        if not config["environment_class"] or (
+            "environment_class" in overrides
+            and get_environment_class(overrides["environment_class"])
+            is not get_environment_class(config["environment_class"])
+        ):
+            # Foreign or missing source environment: the override fully takes over
             config = {}
         config.update(overrides)
+    if not config.get("environment_class"):
+        raise ValueError(
+            "Source episode has no usable environment_type; provide --environment-config with an environment_class"
+        )
     environment_class = get_environment_class(config["environment_class"])
     executor_class = getattr(environment_class, "executor_class", None)
     execution_config = config
