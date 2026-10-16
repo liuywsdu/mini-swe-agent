@@ -25,6 +25,9 @@ class IncusExecutorConfig(BaseModel):
     env: dict[str, str] = {}
     forward_env: list[str] = []
     interpreter: list[str] = Field(default=["bash", "-lc"], min_length=1)
+    profile_wrapper: list[str] = []
+    # Optional syscall profiler prepended to the interpreter inside the instance, e.g. ["strace", "-f", "-c"].
+    # Profiling runs only. The wrapper's stderr is captured separately and stored as output["profile"].
     timeout: float = Field(default=30, gt=0)
     startup_timeout: float = Field(default=240, gt=0)
     cleanup_timeout: float = Field(default=60, gt=0)
@@ -63,8 +66,9 @@ def build_exec_command(
         cwd or config.cwd,
         *[arg for key, value in environment.items() for arg in ("--env", f"{key}={value}")],
         "--",
+        *config.profile_wrapper,
         *config.interpreter,
-        command,
+        f"( {command} ) 2>&1" if config.profile_wrapper else command,
     ]
 
 
@@ -98,7 +102,11 @@ class IncusExecutor(CommandExecutor):
         self, command: str, cwd: str, env: dict[str, str], timeout: float
     ) -> subprocess.CompletedProcess:
         assert self.instance_name, "Incus instance is closed"
-        return run_process(build_exec_command(self.config, self.instance_name, command, cwd, env), timeout=timeout)
+        return run_process(
+            build_exec_command(self.config, self.instance_name, command, cwd, env),
+            timeout=timeout,
+            capture_stderr=bool(self.config.profile_wrapper),
+        )
 
     def cleanup(self) -> None:
         if getattr(self, "instance_name", None) is not None:

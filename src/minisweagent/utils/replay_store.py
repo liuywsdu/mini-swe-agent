@@ -1,4 +1,26 @@
-"""Indexed model calls and deduplicated artifacts for recording and replay."""
+"""Indexed model calls and deduplicated artifacts for recording and replay.
+
+Event conventions (benchmark data collection plan, sections 2 and 6):
+
+- Every event carries dual timestamps: ``wall_ts`` (``time.time``) and
+  ``monotonic_ts`` (``time.monotonic``), auto-stamped by ``ReplayStore.event``.
+  Rows recorded before these columns existed have NULL ``monotonic_ts`` and a
+  ``wall_ts`` backfilled from ``created``.
+- ``round`` is the agent loop round the event belongs to; NULL for
+  session-level events.
+- ``layer`` declares the measurement layer: ``container_cgroup`` or
+  ``guest_cgroup`` (produced by mini); ``host_vmm`` is produced by the VM
+  harness and never appears here. NULL when not applicable.
+- Metric event kinds and their payload fields:
+  - ``action_timing``: ``{round, action_index, timing, resources}``
+  - ``wait_boundary``: ``{round, phase}`` with ``phase`` in ``start``/``end``
+  - ``session_snapshot``: ``{final, workspace_bytes, ...}``; ``final: true``
+    marks episode completeness
+  - ``syscall_profile``: ``{round, action_index, blob}`` (blob is an artifact key)
+- Unsupported measurements are recorded as null, never omitted silently.
+- Export shape for ``guest_events.jsonl``: ``{kind, round, wall_ts,
+  monotonic_ts, layer, payload}`` as returned by ``ReplayStore.event_rows``.
+"""
 
 from __future__ import annotations
 
@@ -45,8 +67,13 @@ class ReplayStore:
                     PRIMARY KEY (episode, round, attempt));
                 CREATE TABLE IF NOT EXISTS events (
                     id INTEGER PRIMARY KEY, episode TEXT NOT NULL, kind TEXT NOT NULL,
-                    payload TEXT NOT NULL, created REAL NOT NULL);
+                    round INTEGER, payload TEXT NOT NULL, created REAL NOT NULL,
+                    wall_ts REAL, monotonic_ts REAL, layer TEXT);
+            """)
+            self._migrate_events(db)
+            db.executescript("""
                 CREATE INDEX IF NOT EXISTS episode_events ON events(episode, id);
+                CREATE INDEX IF NOT EXISTS episode_round_events ON events(episode, round, id);
             """)
 
     def connect(self) -> sqlite3.Connection:
@@ -109,20 +136,55 @@ class ReplayStore:
         with closing(self.connect()) as db:
             db.execute("UPDATE episodes SET metadata=? WHERE id=?", (self.put(without_secrets(metadata)), episode))
 
-    def event(self, episode: str, kind: str, value: Any) -> None:
+    @staticmethod
+    def _migrate_events(db: sqlite3.Connection) -> None:
+        existing = {row["name"] for row in db.execute("PRAGMA table_info(events)")}
+        for name, ddl in {"round": "INTEGER", "wall_ts": "REAL", "monotonic_ts": "REAL", "layer": "TEXT"}.items():
+            if name not in existing:
+                db.execute(f"ALTER TABLE events ADD COLUMN {name} {ddl}")
+        if "wall_ts" not in existing:
+            db.execute("UPDATE events SET wall_ts=created WHERE wall_ts IS NULL")
+
+    def event(self, episode: str, kind: str, value: Any, *, round: int | None = None, layer: str | None = None) -> None:
         reference = self.put(value)
+        wall = time.time()
         with closing(self.connect()) as db:
             db.execute(
-                "INSERT INTO events(episode, kind, payload, created) VALUES (?, ?, ?, ?)",
-                (episode, kind, reference, time.time()),
+                "INSERT INTO events(episode, kind, round, payload, created, wall_ts, monotonic_ts, layer)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (episode, kind, round, reference, wall, wall, time.monotonic(), layer),
             )
 
-    def events(self, episode: str, kind: str) -> list[Any]:
+    def events(self, episode: str, kind: str, *, round: int | None = None) -> list[Any]:
+        return [row["payload"] for row in self.event_rows(episode, kind, round=round)]
+
+    def event_rows(self, episode: str, kind: str | None = None, *, round: int | None = None) -> list[dict]:
+        """Events as {kind, round, wall_ts, monotonic_ts, layer, payload} (guest_events.jsonl shape)."""
+        query = "SELECT kind, round, wall_ts, monotonic_ts, layer, payload FROM events WHERE episode=?"
+        params: list = [episode]
+        if kind is not None:
+            query += " AND kind=?"
+            params.append(kind)
+        if round is not None:
+            query += " AND round=?"
+            params.append(round)
         with closing(self.connect()) as db:
-            rows = db.execute(
-                "SELECT payload FROM events WHERE episode=? AND kind=? ORDER BY id", (episode, kind)
-            ).fetchall()
-        return [self.get(row["payload"]) for row in rows]
+            rows = db.execute(query + " ORDER BY id", params).fetchall()
+        return [
+            {
+                "kind": row["kind"],
+                "round": row["round"],
+                "wall_ts": row["wall_ts"],
+                "monotonic_ts": row["monotonic_ts"],
+                "layer": row["layer"],
+                "payload": self.get(row["payload"]),
+            }
+            for row in rows
+        ]
+
+    def completed(self, episode: str) -> bool:
+        """Episode completeness gate for the harness: a session_snapshot with final: true exists."""
+        return any(event.get("final") for event in self.events(episode, "session_snapshot"))
 
     def start_call(self, episode: str, round: int, attempt: int, request: dict) -> None:
         reference = self.put(request)

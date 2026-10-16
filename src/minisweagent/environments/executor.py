@@ -40,13 +40,15 @@ class ExecutorEnvironment:
         lines = output.get("output", "").lstrip().splitlines(keepends=True)
         if lines and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" and output["returncode"] == 0:
             submission = "".join(lines[1:])
-            raise Submitted(
+            error = Submitted(
                 {
                     "role": "exit",
                     "content": submission,
                     "extra": {"exit_status": "Submitted", "submission": submission},
                 }
             )
+            error.execution_output = output
+            raise error
 
     def get_template_vars(self, **kwargs) -> dict[str, Any]:
         return recursive_merge(platform.uname()._asdict(), self.config.model_dump(), kwargs)

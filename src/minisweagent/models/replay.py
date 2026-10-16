@@ -6,6 +6,7 @@ import copy
 import math
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Literal
 
@@ -20,12 +21,26 @@ from minisweagent.utils.replay_timing import FrozenTiming
 OBSERVATION = "{% if output.exception_info %}<exception>{{output.exception_info}}</exception>\n{% endif %}<returncode>{{output.returncode}}</returncode>\n<output>\n{{output.output}}</output>"
 
 
+@contextmanager
+def _wait_boundary(store: ReplayStore, episode: str, round: int):
+    """Bracket a model wait window with wait_boundary anchors (dual timestamps come from the store)."""
+    store.event(episode, "wait_boundary", {"round": round, "phase": "start"}, round=round)
+    try:
+        yield
+    finally:
+        store.event(episode, "wait_boundary", {"round": round, "phase": "end"}, round=round)
+
+
 @dataclass
 class RecordingConfig:
     store_path: str
     episode_id: str
     backend: dict
     model_name: str = "recording"
+    benchmark: str = ""
+    task_id: str = ""
+    attempt: int = 0
+    profile_digest: str = ""
 
 
 class _RecordingLitellm(LitellmModel):
@@ -49,10 +64,27 @@ class _RecordingLitellm(LitellmModel):
 
 class RecordingModel:
     def __init__(
-        self, *, store_path: str, episode_id: str, backend: dict | None = None, model_name: str = "recording", **kwargs
+        self,
+        *,
+        store_path: str,
+        episode_id: str,
+        backend: dict | None = None,
+        model_name: str = "recording",
+        benchmark: str = "",
+        task_id: str = "",
+        attempt: int = 0,
+        profile_digest: str = "",
+        **kwargs,
     ):
         self.config = RecordingConfig(
-            store_path, episode_id, backend or {"model_name": model_name, **kwargs}, model_name
+            store_path,
+            episode_id,
+            backend or {"model_name": model_name, **kwargs},
+            model_name,
+            benchmark,
+            task_id,
+            attempt,
+            profile_digest,
         )
         self.store = ReplayStore(self.config.store_path)
         self.episode_id = self.config.episode_id
@@ -75,6 +107,10 @@ class RecordingModel:
             {
                 "model_config": self.backend.config.model_dump(mode="json"),
                 "sdk_attempts_recorded": cls is LitellmModel,
+                "benchmark": self.config.benchmark,
+                "task_id": self.config.task_id,
+                "attempt": self.config.attempt,
+                "profile_digest": self.config.profile_digest,
             },
         )
 
@@ -86,11 +122,12 @@ class RecordingModel:
             "messages": self.store.message_refs(messages),
             "kwargs": without_secrets(kwargs),
         }
-        with self.store.capture(self.episode_id, self.round, request) as capture:
-            response = self.backend.query(messages, **kwargs)
-            response.setdefault("extra", {})["trace"] = {"episode_id": self.episode_id, "round": self.round}
-            capture.response = response
-            return response
+        with _wait_boundary(self.store, self.episode_id, self.round):
+            with self.store.capture(self.episode_id, self.round, request) as capture:
+                response = self.backend.query(messages, **kwargs)
+                response.setdefault("extra", {})["trace"] = {"episode_id": self.episode_id, "round": self.round}
+                capture.response = response
+                return response
 
     def format_message(self, **kwargs) -> dict:
         return self.backend.format_message(**kwargs)
@@ -125,6 +162,10 @@ class ReplayConfig:
     divergence: Literal["record", "error"] = "record"
     timing_manifest: str | None = None
     timing_replica_id: str = "0"
+    benchmark: str = ""
+    task_id: str = ""
+    attempt: int = 0
+    profile_digest: str = ""
 
 
 class ReplayModel:
@@ -142,6 +183,11 @@ class ReplayModel:
             raise ValueError("Use divergence=record|error")
         self.store = ReplayStore(self.config.store_path)
         self.source = self.store.metadata(self.config.source_episode_id)
+        source_digest = self.source.get("profile_digest", "")
+        if self.config.profile_digest and source_digest and self.config.profile_digest != source_digest:
+            raise ValueError(
+                f"profile_digest mismatch: {self.config.profile_digest} != source {source_digest}; refusing to start"
+            )
         self.frozen_timing = (
             FrozenTiming(
                 self.config.timing_manifest, self.store, self.config.source_episode_id, self.config.timing_replica_id
@@ -161,6 +207,10 @@ class ReplayModel:
                 "timing": self.config.timing,
                 "time_scale": self.config.time_scale,
                 "simulated_timing": self.frozen_timing.reference if self.frozen_timing else None,
+                "benchmark": self.config.benchmark or self.source.get("benchmark", ""),
+                "task_id": self.config.task_id or self.source.get("task_id", ""),
+                "attempt": self.config.attempt,
+                "profile_digest": self.config.profile_digest or source_digest,
             },
         )
 
@@ -192,7 +242,7 @@ class ReplayModel:
             "differences": differences,
             "actual_messages": actual_refs,
         }
-        self.store.event(self.episode_id, "replay_match", audit)
+        self.store.event(self.episode_id, "replay_match", audit, round=self.round)
         if not audit["structure_matches"]:
             raise ValueError(
                 f"Replay round {self.round}: message/tool-call structure changed; refusing to shift rounds"
@@ -204,81 +254,83 @@ class ReplayModel:
     def query(self, messages: list[dict], **kwargs) -> dict:
         started = time.perf_counter()
         self.round += 1
-        call = self.store.call(self.config.source_episode_id, self.round)
-        if call["status"] == "pending":
-            raise ValueError(f"Replay round {self.round} was interrupted before its response was saved")
-        audit = self._audit(call["request"]["messages"], messages)
-        wait_seconds = 0.0
-        target_seconds = 0.0
-        simulated = self.frozen_timing.row(self.round) if self.frozen_timing else None
-        if self.config.timing == "recorded":
-            if call["duration"] is None:
-                raise ValueError(
-                    "Recorded model duration is unavailable; import timing events or explicitly use timing=instant"
-                )
-            if not math.isfinite(call["duration"]) or call["duration"] < 0:
-                raise ValueError("Recorded model duration must be finite and nonnegative")
-            target_seconds = call["duration"] * self.config.time_scale
-        elif simulated is not None:
-            target_seconds = simulated["duration_seconds"] * self.config.time_scale
-        if not math.isfinite(target_seconds):
-            raise ValueError("Scaled replay duration must be finite")
-        before_sleep = time.perf_counter()
-        if self.config.timing != "instant":
-            wait_seconds = max(0, target_seconds - (before_sleep - started))
-            time.sleep(wait_seconds)
-        after_sleep = time.perf_counter()
-        self.store.event(
-            self.episode_id,
-            "replay_timing",
-            {
-                "round": self.round,
-                "timing": self.config.timing,
-                "time_scale": self.config.time_scale,
+        with _wait_boundary(self.store, self.episode_id, self.round):
+            call = self.store.call(self.config.source_episode_id, self.round)
+            if call["status"] == "pending":
+                raise ValueError(f"Replay round {self.round} was interrupted before its response was saved")
+            audit = self._audit(call["request"]["messages"], messages)
+            wait_seconds = 0.0
+            target_seconds = 0.0
+            simulated = self.frozen_timing.row(self.round) if self.frozen_timing else None
+            if self.config.timing == "recorded":
+                if call["duration"] is None:
+                    raise ValueError(
+                        "Recorded model duration is unavailable; import timing events or explicitly use timing=instant"
+                    )
+                if not math.isfinite(call["duration"]) or call["duration"] < 0:
+                    raise ValueError("Recorded model duration must be finite and nonnegative")
+                target_seconds = call["duration"] * self.config.time_scale
+            elif simulated is not None:
+                target_seconds = simulated["duration_seconds"] * self.config.time_scale
+            if not math.isfinite(target_seconds):
+                raise ValueError("Scaled replay duration must be finite")
+            before_sleep = time.perf_counter()
+            if self.config.timing != "instant":
+                wait_seconds = max(0, target_seconds - (before_sleep - started))
+                time.sleep(wait_seconds)
+            after_sleep = time.perf_counter()
+            self.store.event(
+                self.episode_id,
+                "replay_timing",
+                {
+                    "round": self.round,
+                    "timing": self.config.timing,
+                    "time_scale": self.config.time_scale,
+                    "source_duration_seconds": call["duration"],
+                    "simulated_duration_seconds": simulated["duration_seconds"] if simulated else None,
+                    "simulation": (self.frozen_timing.reference | {"donor_sample_id": simulated["donor_sample_id"]})
+                    if simulated
+                    else None,
+                    "target_duration_seconds": target_seconds,
+                    "requested_sleep_seconds": wait_seconds,
+                    "actual_sleep_seconds": after_sleep - before_sleep,
+                    "pre_wait_seconds": before_sleep - started,
+                    "deadline_lateness_seconds": max(0, after_sleep - started - target_seconds)
+                    if self.config.timing != "instant"
+                    else None,
+                    "elapsed_seconds": after_sleep - started,
+                },
+                round=self.round,
+            )
+            if call["error"] is not None:
+                error = call["error"]
+                if error["type"] == "FormatError":
+                    messages = copy.deepcopy(error["messages"])
+                    for message in messages:
+                        extra = message.setdefault("extra", {})
+                        extra["source_cost"] = extra.get("cost", 0.0)
+                        extra["cost"] = 0.0
+                    raise FormatError(*messages)
+                raise RuntimeError(f"Recorded model failure in round {self.round}: {error['type']}; no API fallback")
+            if not isinstance(call["response"], dict):
+                raise ValueError(f"Replay round {self.round} has no model response")
+            response = copy.deepcopy(call["response"])
+            extra = response.setdefault("extra", {})
+            extra["replay"] = {
+                "source_episode_id": self.config.source_episode_id,
+                "source_round": self.round,
+                "episode_id": self.episode_id,
+                "source_cost": extra.get("cost", 0.0),
+                "source_timestamp": extra.get("timestamp"),
                 "source_duration_seconds": call["duration"],
                 "simulated_duration_seconds": simulated["duration_seconds"] if simulated else None,
-                "simulation": (self.frozen_timing.reference | {"donor_sample_id": simulated["donor_sample_id"]})
-                if simulated
-                else None,
-                "target_duration_seconds": target_seconds,
-                "requested_sleep_seconds": wait_seconds,
-                "actual_sleep_seconds": after_sleep - before_sleep,
-                "pre_wait_seconds": before_sleep - started,
-                "deadline_lateness_seconds": max(0, after_sleep - started - target_seconds)
-                if self.config.timing != "instant"
-                else None,
-                "elapsed_seconds": after_sleep - started,
-            },
-        )
-        if call["error"] is not None:
-            error = call["error"]
-            if error["type"] == "FormatError":
-                messages = copy.deepcopy(error["messages"])
-                for message in messages:
-                    extra = message.setdefault("extra", {})
-                    extra["source_cost"] = extra.get("cost", 0.0)
-                    extra["cost"] = 0.0
-                raise FormatError(*messages)
-            raise RuntimeError(f"Recorded model failure in round {self.round}: {error['type']}; no API fallback")
-        if not isinstance(call["response"], dict):
-            raise ValueError(f"Replay round {self.round} has no model response")
-        response = copy.deepcopy(call["response"])
-        extra = response.setdefault("extra", {})
-        extra["replay"] = {
-            "source_episode_id": self.config.source_episode_id,
-            "source_round": self.round,
-            "episode_id": self.episode_id,
-            "source_cost": extra.get("cost", 0.0),
-            "source_timestamp": extra.get("timestamp"),
-            "source_duration_seconds": call["duration"],
-            "simulated_duration_seconds": simulated["duration_seconds"] if simulated else None,
-            "timing_manifest_sha256": self.frozen_timing.sha256 if self.frozen_timing else None,
-            "actual_api_calls": 0,
-            "input_difference_count": len(audit["differences"]),
-        }
-        extra["cost"] = 0.0
-        extra["timestamp"] = time.time()
-        return response
+                "timing_manifest_sha256": self.frozen_timing.sha256 if self.frozen_timing else None,
+                "actual_api_calls": 0,
+                "input_difference_count": len(audit["differences"]),
+            }
+            extra["cost"] = 0.0
+            extra["timestamp"] = time.time()
+            return response
 
     def format_message(self, **kwargs) -> dict:
         return expand_multimodal_content(
@@ -302,7 +354,9 @@ class ReplayModel:
                 "round": self.round,
                 "messages": self.store.message_refs(result),
                 "returncodes": [r.get("returncode") for r in outputs],
+                "durations": [(r.get("timing") or {}).get("monotonic_seconds") for r in outputs],
             },
+            round=self.round,
         )
         return result
 

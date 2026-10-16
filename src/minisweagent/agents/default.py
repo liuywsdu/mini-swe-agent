@@ -33,6 +33,8 @@ class AgentConfig(BaseModel):
     """Exit after this many format errors in a row (0 = no limit)."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
+    profile_workspace_per_action: bool = False
+    """Measure workspace bytes (du -sb) after every action; profiling runs only."""
 
 
 class DefaultAgent:

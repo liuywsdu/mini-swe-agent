@@ -117,8 +117,15 @@ def import_command(
     episode: str = typer.Option(...),
     events: Path | None = typer.Option(None, help="Original profiler events.jsonl, for exact model-call durations"),
     task_id: str = typer.Option("", help="ID in the timing events; defaults to trajectory's parent directory name"),
+    benchmark: str = typer.Option("", help="Benchmark collection this episode belongs to"),
+    attempt: int = typer.Option(0, help="Attempt number within the (benchmark, task_id) matrix"),
+    profile_digest: str = typer.Option("", help="Digest of the measurement profile this episode runs under"),
 ) -> None:
-    result = import_trajectory(ReplayStore(store), trajectory, episode, events, task_id or trajectory.parent.name)
+    tape = ReplayStore(store)
+    result = import_trajectory(tape, trajectory, episode, events, task_id or trajectory.parent.name)
+    metadata = tape.metadata(episode)
+    metadata.update(benchmark=benchmark, attempt=attempt, profile_digest=profile_digest)
+    tape.update_metadata(episode, metadata)
     typer.echo(
         json.dumps({"episode_id": episode, "rounds": result["rounds"], "timing_source": result["timing_source"]})
     )
@@ -133,6 +140,27 @@ def export_command(
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(export_trajectory(ReplayStore(store), episode), ensure_ascii=False, indent=2))
     typer.echo(str(output))
+
+
+@app.command("export-events")
+def export_events_command(
+    store: Path = typer.Option(...),
+    episode: str = typer.Option(...),
+    output: Path = typer.Option(..., help="guest_events.jsonl destination; existing files are never overwritten"),
+) -> None:
+    """Export guest-layer events as JSONL: {kind, round, wall_ts, monotonic_ts, layer, payload} per line."""
+    if output.exists():
+        raise ValueError("Refusing to overwrite an existing events file")
+    tape = ReplayStore(store)
+    rows = tape.event_rows(episode)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+    typer.echo(
+        json.dumps(
+            {"episode_id": episode, "events": len(rows), "completed": tape.completed(episode)},
+            ensure_ascii=False,
+        )
+    )
 
 
 @app.command("inspect")
@@ -216,6 +244,12 @@ def run_command(
     timing_replica_id: str = typer.Option("0", help="Replica ID bound into the simulated timing manifest"),
     divergence: str = typer.Option("record", help="record or error for changed input text"),
     environment_config: Path | None = typer.Option(None, help="Optional JSON/YAML environment override"),
+    benchmark: str = typer.Option("", help="Benchmark collection this episode belongs to"),
+    task_id: str = typer.Option("", help="Task ID within the benchmark; defaults to the source episode's"),
+    attempt: int = typer.Option(0, help="Attempt number within the (benchmark, task_id) matrix"),
+    profile_digest: str = typer.Option(
+        "", help="Expected measurement profile digest; a mismatch with the source episode aborts the run"
+    ),
 ) -> None:
     if output.exists():
         raise ValueError("Refusing to overwrite an existing trajectory")
@@ -228,6 +262,10 @@ def run_command(
         divergence=divergence,
         timing_manifest=str(timing_manifest) if timing_manifest is not None else None,
         timing_replica_id=timing_replica_id,
+        benchmark=benchmark,
+        task_id=task_id,
+        attempt=attempt,
+        profile_digest=profile_digest,
     )
     source_info = model.source.get("trajectory_info", model.source.get("trajectory", {}).get("info", {}))
     if not source_info:

@@ -3,10 +3,13 @@ import os
 import shlex
 import subprocess
 import uuid
+from pathlib import Path
 
 from pydantic import BaseModel
 
 from minisweagent.executors.base import CommandExecutor, run_process
+from minisweagent.utils.cgroup import read_container_cgroup_stats
+from minisweagent.utils.netdev import read_net_dev
 
 
 class DockerExecutorConfig(BaseModel):
@@ -39,9 +42,15 @@ class DockerExecutorConfig(BaseModel):
     The actual command will be appended as argument to this. Override this to e.g., modify shell flags
     (e.g., to remove the `-l` flag to disable login shell) or to use python instead of bash to interpret commands.
     """
+    profile_wrapper: list[str] = []
+    """Optional syscall profiler prepended to the interpreter inside the container, e.g. ["strace", "-f", "-c"].
+    Profiling runs only. The wrapper's stderr is captured separately and stored as output["profile"]."""
 
 
 class DockerExecutor(CommandExecutor):
+    cgroup_layer = "container_cgroup"
+    network_observation_point = "container_netns_init_pid"
+
     def __init__(
         self,
         *,
@@ -76,7 +85,31 @@ class DockerExecutor(CommandExecutor):
         self, command: str, cwd: str, env: dict[str, str], timeout: float
     ) -> subprocess.CompletedProcess[str]:
         assert self.container_id, "Container not started"
-        return run_process(build_exec_command(self.config, self.container_id, command, cwd, env), timeout=timeout)
+        return run_process(
+            build_exec_command(self.config, self.container_id, command, cwd, env),
+            timeout=timeout,
+            capture_stderr=bool(self.config.profile_wrapper),
+        )
+
+    def cgroup_stats(self) -> dict[str, int | None] | None:
+        return read_container_cgroup_stats(self.container_id) if self.container_id else None
+
+    def net_dev_stats(self) -> dict[str, int] | None:
+        # /proc/<container init pid>/net/dev reflects the container network namespace.
+        # Observation failures must not break the agent run: record null instead.
+        if not self.container_id:
+            return None
+        try:
+            result = subprocess.run(
+                [self.config.executable, "inspect", "-f", "{{.State.Pid}}", self.container_id],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            pid = int(result.stdout.strip()) if result.returncode == 0 else 0
+            return read_net_dev(Path(f"/proc/{pid}/net/dev")) if pid > 0 else None
+        except (OSError, ValueError):
+            return None
 
     def cleanup(self) -> None:
         """Stop and remove the Docker container."""
@@ -117,6 +150,8 @@ def build_exec_command(
     config: DockerExecutorConfig, container_id: str, command: str, cwd: str, env: dict[str, str]
 ) -> list[str]:
     environment = {name: os.environ[name] for name in config.forward_env if name in os.environ} | config.env | env
+    if config.profile_wrapper:
+        command = f"( {command} ) 2>&1"
     return [
         config.executable,
         "exec",
@@ -124,6 +159,7 @@ def build_exec_command(
         cwd or config.cwd,
         *[arg for key, value in environment.items() for arg in ("-e", f"{key}={value}")],
         container_id,
+        *config.profile_wrapper,
         *config.interpreter,
         command,
     ]
