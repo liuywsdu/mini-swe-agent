@@ -73,7 +73,12 @@ def test_executor_is_independent_of_agent_submission_and_keeps_call_options_loca
             cwd=str(other),
             env={"EXECUTOR_VALUE": "a 'quote'; $(exit 42)"},
         )
-        assert result == {"output": f"a 'quote'; $(exit 42)\n{other}\nstderr\n", "returncode": 7, "exception_info": ""}
+        assert set(result) == {"output", "returncode", "exception_info", "timing", "resources"}
+        assert {key: result[key] for key in ("output", "returncode", "exception_info")} == {
+            "output": f"a 'quote'; $(exit 42)\n{other}\nstderr\n",
+            "returncode": 7,
+            "exception_info": "",
+        }
         assert executor.execute('printf "%s\\n" "$EXECUTOR_VALUE" "$PWD"')["output"] == f"configured\n{tmp_path}\n"
         command = "printf 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT\\npatch\\n'"
         assert executor.execute(command)["output"].endswith("patch\n")
