@@ -71,13 +71,21 @@ class DockerExecutor(CommandExecutor):
         container_name = f"minisweagent-{uuid.uuid4().hex}"
         cmd = build_run_command(self.config, container_name)
         self.logger.debug(f"Starting container with command: {shlex.join(cmd)}")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self.config.pull_timeout,  # docker pull might take a while
-            check=True,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.config.pull_timeout,  # docker pull might take a while
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                "Docker container start failed: "
+                f"command={shlex.join(cmd)} "
+                f"returncode={exc.returncode} "
+                f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+            ) from exc
         self.logger.info(f"Started container {container_name} with ID {result.stdout.strip()}")
         self.container_id = result.stdout.strip()
 

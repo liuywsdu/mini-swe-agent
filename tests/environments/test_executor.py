@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import subprocess
 
 import pytest
 from typer.testing import CliRunner
@@ -258,3 +259,19 @@ def test_replay_cli_uses_injected_executor_and_records_new_tool_outputs(tmp_path
     assert replayed["info"]["submission"] == "new-output"
     assert "new-output" in replayed["messages"][3]["content"]
     assert replayed["info"]["config"]["environment_type"].endswith(".ExecutorEnvironment")
+
+
+def test_docker_start_error_includes_daemon_output(monkeypatch, tmp_path):
+    from minisweagent.executors.docker import DockerExecutor
+
+    def fail_docker_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(
+            125,
+            args[0],
+            output="",
+            stderr="driver failed programming external connectivity: iptables permission denied",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fail_docker_run)
+    with pytest.raises(RuntimeError, match="iptables permission denied"):
+        DockerExecutor(image="test-image", pull_timeout=1)
